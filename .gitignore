@@ -2,3 +2,5 @@ saved_params*
 saved_state*
 a2/utils/datasets/*
 *.pyc
+.ipynb_checkpoints
+.DS_Store
