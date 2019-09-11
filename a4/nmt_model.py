@@ -72,7 +72,14 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/nn.html#torch.nn.Linear
         ###     Dropout Layer:
         ###         https://pytorch.org/docs/stable/nn.html#torch.nn.Dropout
-
+        self.encoder = nn.LSTM(embed_size, self.hidden_size, bias = True, bidirectional = True)
+        self.decoder = nn.LSTMCell(embed_size + self.hidden_size, self.hidden_size, bias = True)
+        self.h_projection = nn.Linear(2 * self.hidden_size, self.hidden_size, bias = False)
+        self.c_projection = nn.Linear(2 * self.hidden_size, self.hidden_size, bias = False)
+        self.att_projection = nn.Linear(2 * self.hidden_size, self.hidden_size, bias = False)
+        self.combined_output_projection = nn.Linear(3 * self.hidden_size, self.hidden_size, bias = False)
+        self.target_vocab_projection = nn.Linear(self.hidden_size, len(self.vocab.tgt))
+        self.dropout = nn.Dropout(p = self.dropout_rate)
 
         ### END YOUR CODE
 
@@ -139,7 +146,7 @@ class NMT(nn.Module):
         ###     2. Compute `enc_hiddens`, `last_hidden`, `last_cell` by applying the encoder to `X`.
         ###         - Before you can apply the encoder, you need to apply the `pack_padded_sequence` function to X.
         ###         - After you apply the encoder, you need to apply the `pad_packed_sequence` function to enc_hiddens.
-        ###         - Note that the shape of the tensor returned by the encoder is (src_len b, h*2) and we want to
+        ###         - Note that the shape of the tensor returned by the encoder is (src_len, b, h*2) and we want to
         ###           return a tensor of shape (b, src_len, h*2) as `enc_hiddens`.
         ###     3. Compute `dec_init_state` = (init_decoder_hidden, init_decoder_cell):
         ###         - `init_decoder_hidden`:
@@ -162,9 +169,16 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.cat
         ###     Tensor Permute:
         ###         https://pytorch.org/docs/stable/tensors.html#torch.Tensor.permute
-
-
+        X = self.model_embeddings.source(source_padded)  # input.shape = (src_len, b, e)
+        X = nn.utils.rnn.pack_padded_sequence(X, source_lengths)
+        output, (final_hidden, final_cell) = self.encoder(X)
+        enc_hiddens, _ = nn.utils.rnn.pad_packed_sequence(output)
+        enc_hiddens = enc_hiddens.permute(1, 0, 2)
+        dec_init_hidden = self.h_projection(torch.cat((final_hidden[0], final_hidden[1]), dim = 1))
+        dec_init_cell = self.c_projection(torch.cat((final_cell[0], final_cell[1]), dim = 1))
+        dec_init_state = (dec_init_hidden, dec_init_cell)
         ### END YOUR CODE
+        
 
         return enc_hiddens, dec_init_state
 
@@ -232,8 +246,17 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.cat
         ###     Tensor Stacking:
         ###         https://pytorch.org/docs/stable/torch.html#torch.stack
-
-
+        enc_hiddens_proj = self.att_projection(enc_hiddens)
+        Y = self.model_embeddings.target(target_padded)
+        for Y_t in torch.split(Y, 1):
+            Y_t = torch.squeeze(Y_t, dim = 0)
+            Ybar_t = torch.cat((Y_t, o_prev), dim = 1)
+            Ybar_t = torch.cat((Y_t, o_prev), dim = 1)
+            dec_state, o_t, e_t = self.step(Ybar_t, dec_state, enc_hiddens, enc_hiddens_proj, enc_masks)
+            combined_outputs.append(o_t)
+            o_prev = o_t
+        combined_outputs = torch.stack(combined_outputs)
+            
         ### END YOUR CODE
 
         return combined_outputs
@@ -290,13 +313,14 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.unsqueeze
         ###     Tensor Squeeze:
         ###         https://pytorch.org/docs/stable/torch.html#torch.squeeze
-
-
+        dec_state = self.decoder(Ybar_t, dec_state)
+        dec_hidden, dec_cell = dec_state
+        e_t = torch.bmm(enc_hiddens_proj, dec_hidden.unsqueeze(dim = 2)).squeeze(dim = 2)
         ### END YOUR CODE
-
         # Set e_t to -inf where enc_masks has 1
+        # This makes the corresponding a_t be zero after taking softmax because exp(-inf) = 0. Incidentally, these pads are guaranteed not to have any weights in attention mechanism.
         if enc_masks is not None:
-            e_t.data.masked_fill_(enc_masks.byte(), -float('inf'))
+            e_t.data.masked_fill_(enc_masks.bool(), -float('inf'))
 
         ### YOUR CODE HERE (~6 Lines)
         ### TODO:
@@ -326,7 +350,11 @@ class NMT(nn.Module):
         ###     Tanh:
         ###         https://pytorch.org/docs/stable/torch.html#torch.tanh
 
-
+        alpha_t = F.softmax(e_t, dim = 1)
+        a_t = torch.bmm(alpha_t.unsqueeze(dim = 1), enc_hiddens).squeeze(dim = 1)
+        U_t = torch.cat((a_t, dec_hidden), dim = 1)
+        V_t = self.combined_output_projection(U_t)
+        O_t = self.dropout(torch.tanh(V_t))
         ### END YOUR CODE
 
         combined_output = O_t
